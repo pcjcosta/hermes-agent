@@ -16,7 +16,7 @@ jobs:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN_HERMES }}
           fetch-depth: 0
 
       - name: Sync upstream
