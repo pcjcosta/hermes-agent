@@ -958,106 +958,15 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 
-def _is_interrupted_tool_result(content: Any) -> bool:
-    """Return True if a tool result indicates the tool was interrupted."""
-    if not isinstance(content, str):
-        return False
-    lowered = content.lower()
-    if "[command interrupted]" in lowered:
-        return True
-    if "exit_code" in lowered and ("130" in lowered or "-1" in lowered):
-        return "interrupt" in lowered
-    return False
-
-
-def _strip_interrupted_tool_tails(
-    agent_history: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Strip interrupted assistant→tool sequences from replay history.
-
-    Older interrupted gateway turns can be followed by a queued real user
-    message, so the interrupted assistant/tool block is not necessarily the
-    final tail by the time we rebuild replay history.  Remove any contiguous
-    assistant(tool_calls) + tool-result block that contains an interrupted tool
-    result, while preserving successful tool-call sequences intact.
-    """
-    if not agent_history:
-        return agent_history
-
-    cleaned: List[Dict[str, Any]] = []
-    i = 0
-    n = len(agent_history)
-    while i < n:
-        msg = agent_history[i]
-        if msg.get("role") == "assistant" and "tool_calls" in msg:
-            j = i + 1
-            tool_results: List[Dict[str, Any]] = []
-            while j < n and agent_history[j].get("role") == "tool":
-                tool_results.append(agent_history[j])
-                j += 1
-            if tool_results and any(
-                _is_interrupted_tool_result(m.get("content", ""))
-                for m in tool_results
-            ):
-                logger.debug(
-                    "Stripping interrupted assistant→tool replay block "
-                    "(indices %d–%d, tool_results=%d)",
-                    i, j - 1, len(tool_results),
-                )
-                i = j
-                continue
-        if msg.get("role") == "tool" and _is_interrupted_tool_result(msg.get("content", "")):
-            logger.debug("Stripping orphan interrupted tool result from replay history")
-            i += 1
-            continue
-        cleaned.append(msg)
-        i += 1
-
-    return cleaned
-
-
-def _strip_dangling_tool_call_tail(
-    agent_history: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Strip a trailing ``assistant(tool_calls)`` block left with NO answers.
-
-    When a tool call itself kills the gateway process (``docker restart``,
-    ``systemctl restart``, ``kill``, ``hermes gateway restart``), the process
-    is terminated by SIGKILL *mid-call* — before the tool result is ever
-    written and before the orderly shutdown rewind
-    (``_drop_trailing_empty_response_scaffolding``) can run.  The last thing
-    persisted is the ``assistant`` message that issued the ``tool_calls``,
-    with zero matching ``tool`` rows.
-
-    On resume the model sees an unanswered tool call at the tail and naturally
-    re-issues it — which restarts the gateway again, producing the infinite
-    reboot loop in #49201.  ``_strip_interrupted_tool_tails`` does not catch
-    this because there is no tool result to inspect for an interrupt marker.
-
-    This strips that dangling tail at the source so there is nothing for the
-    model to re-execute.  It only acts when the tail is an
-    ``assistant(tool_calls)`` whose calls have NO corresponding ``tool``
-    results — a completed assistant→tool pair (any tool answers present) is
-    left untouched so genuine mid-progress tool loops still resume.
-    """
-    if not agent_history:
-        return agent_history
-
-    last = agent_history[-1]
-    if not (
-        isinstance(last, dict)
-        and last.get("role") == "assistant"
-        and last.get("tool_calls")
-    ):
-        return agent_history
-
-    logger.debug(
-        "Stripping dangling unanswered assistant(tool_calls) tail "
-        "(%d call(s)) — process likely killed mid-tool-call by a "
-        "restart/shutdown command (#49201)",
-        len(last.get("tool_calls") or []),
-    )
-    return agent_history[:-1]
+# Replay-tail sanitization lives in agent/replay_cleanup.py so every resume
+# surface (this messaging gateway AND the TUI/WebUI gateway) shares one
+# implementation.  Re-exported under the historical private names so existing
+# call sites and tests keep working.
+from agent.replay_cleanup import (  # noqa: E402
+    is_interrupted_tool_result as _is_interrupted_tool_result,
+    strip_interrupted_tool_tails as _strip_interrupted_tool_tails,
+    strip_dangling_tool_call_tail as _strip_dangling_tool_call_tail,
+)
 
 
 _AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
@@ -2618,6 +2527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_task_started: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
+    _detached_restart_helper_started: bool = False
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
     _restart_task: Optional[asyncio.Task] = None
@@ -2660,11 +2570,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
-        # Wire process registry into session store for reset protection
+        # Wire process registry into session store for reset protection.
+        # A background process older than the configured threshold (default 24h,
+        # session_reset.bg_process_max_age_hours) is treated as stale and no
+        # longer blocks session idle / daily reset — see #29177. The process is
+        # NOT killed, only ignored by the reset guard.
         from tools.process_registry import process_registry
+        _bg_max_age_hours = getattr(
+            self.config.default_reset_policy, "bg_process_max_age_hours", 24
+        )
+        _bg_max_age_seconds = (
+            _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
+        )
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
-            has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
+            has_active_processes_fn=lambda key: process_registry.has_active_for_session(
+                key, max_active_age=_bg_max_age_seconds,
+            ),
         )
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
@@ -2699,6 +2621,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_task_started = False
         self._restart_detached = False
         self._restart_via_service = False
+        self._detached_restart_helper_started = False
         self._restart_command_source: Optional[SessionSource] = None
         self._stop_task: Optional[asyncio.Task] = None
         self._restart_task: Optional[asyncio.Task] = None
@@ -5439,8 +5362,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
             return
+        if self._detached_restart_helper_started:
+            return
+        self._detached_restart_helper_started = True
 
         current_pid = os.getpid()
+        restart_after_s = max(float(getattr(self, "_restart_drain_timeout", 0.0) or 0.0) + 5.0, 5.0)
 
         # On Windows there's no bash/setsid chain — spawn a tiny Python
         # watcher directly via sys.executable instead.  The watcher polls
@@ -5457,8 +5384,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 import os, subprocess, sys, time
                 from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway
                 pid = int(sys.argv[1])
-                cmd = sys.argv[2:]
-                deadline = time.monotonic() + 120
+                restart_after_s = float(sys.argv[2])
+                cmd = sys.argv[3:]
+                deadline = time.monotonic() + restart_after_s
 
                 def _alive(p):
                     # On Windows, os.kill(pid, 0) is NOT a no-op — it maps to
@@ -5514,7 +5442,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pythonpath.append(watcher_env["PYTHONPATH"])
                 watcher_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath))
             subprocess.Popen(
-                [sys.executable, "-c", watcher, str(current_pid), *cmd_argv],
+                [sys.executable, "-c", watcher, str(current_pid), str(restart_after_s), *cmd_argv],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=watcher_env,
@@ -5524,7 +5452,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
         shell_cmd = (
-            f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
+            f"deadline=$(( $(date +%s) + {int(restart_after_s)} )); "
+            f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
             f"{cmd} gateway restart"
         )
         # Same marker scrub as the Windows watcher above: this watcher runs
@@ -5638,6 +5567,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_task_started = True
 
         async def _run_restart() -> None:
+            if detached:
+                try:
+                    await self._launch_detached_restart_command()
+                except Exception as e:
+                    logger.error("Failed to launch detached gateway restart helper: %s", e)
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
@@ -5877,7 +5811,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning(
                     "Stale systemd unit detected: %s has TimeoutStopSec=%.0fs but "
                     "drain_timeout=%.0fs (expected >=%.0fs). systemd may SIGKILL the "
-                    "gateway mid-drain. Run `hermes gateway service install --replace` "
+                    "gateway mid-drain. Run `hermes gateway install --force` "
                     "to regenerate the unit, or shorten agent.restart_drain_timeout.",
                     _alignment.get("unit", "(unknown)"),
                     _alignment["timeout_stop_sec"],

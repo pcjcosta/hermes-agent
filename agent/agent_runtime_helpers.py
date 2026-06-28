@@ -1078,6 +1078,34 @@ def restore_primary_runtime(agent) -> bool:
             api_mode=rt.get("compressor_api_mode", ""),
         )
 
+        # ── Re-select from the credential pool if one is available ──
+        # The snapshot's api_key was captured at construction time.  Across
+        # turns the pool may have rotated (token revocation, billing/rate-limit
+        # exhaustion, cooldown), leaving the snapshot key stale.  Restoring it
+        # blindly re-fails on the first request and burns through the remaining
+        # pool entries before cross-provider fallback even gets a chance.  Ask
+        # the pool for its current best entry and swap the live credential in.
+        # When the pool is absent, empty, or the entry has no usable key, we
+        # keep the snapshot key (the existing behavior).  Fixes #25205.
+        pool = getattr(agent, "_credential_pool", None)
+        if pool is not None and pool.has_available():
+            entry = pool.select()
+            if entry is not None:
+                entry_key = (
+                    getattr(entry, "runtime_api_key", None)
+                    or getattr(entry, "access_token", "")
+                )
+                if entry_key:
+                    # ``_swap_credential`` rebuilds the OpenAI/Anthropic client,
+                    # reapplies base-url-scoped headers, and carries the
+                    # accumulated base_url / OAuth-detection fixes (#33163).
+                    agent._swap_credential(entry)
+                    logger.info(
+                        "Restore re-selected pool entry %s (%s)",
+                        getattr(entry, "id", "?"),
+                        getattr(entry, "label", "?"),
+                    )
+
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
@@ -2177,8 +2205,21 @@ def looks_like_codex_intermediate_ack(
     user_message: str,
     assistant_content: str,
     messages: List[Dict[str, Any]],
+    require_workspace: bool = True,
 ) -> bool:
-    """Detect a planning/ack message that should continue instead of ending the turn."""
+    """Detect a planning/ack message that should continue instead of ending the turn.
+
+    ``require_workspace`` (default True) keeps the original codex-coding scope:
+    the ack must reference a filesystem/repo workspace. The conversation loop
+    passes ``require_workspace=False`` when the user has explicitly opted into
+    intent-ack continuation for all api_modes (``agent.intent_ack_continuation``
+    is ``true`` or a model-list), so general autonomous workflows ("I'll run a
+    health check on the server", "I'll start the deployment") — which carry a
+    future-ack and an action verb but no filesystem reference — are caught too.
+    The future-ack + short-content + no-prior-tools + action-verb requirements
+    always apply, which is what keeps conversational "I'll help you brainstorm"
+    replies from tripping it.
+    """
     if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
         return False
 
@@ -2231,17 +2272,67 @@ def looks_like_codex_intermediate_ack(
         "path",
     )
 
+    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
+    if not assistant_mentions_action:
+        return False
+
+    # Opted-in (all-api_mode) path: a future-ack + action verb + no prior tool
+    # call is enough — the user asked us to keep going when the model only
+    # announces intent, regardless of whether a filesystem is involved.
+    if not require_workspace:
+        return True
+
     user_text = (user_message or "").strip().lower()
     user_targets_workspace = (
         any(marker in user_text for marker in workspace_markers)
         or "~/" in user_text
         or "/" in user_text
     )
-    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
     assistant_targets_workspace = any(
         marker in assistant_text for marker in workspace_markers
     )
-    return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
+    return user_targets_workspace or assistant_targets_workspace
+
+
+def intent_ack_continuation_mode(agent) -> str:
+    """Classify the resolved intent-ack continuation mode for this turn.
+
+    Returns one of:
+      * ``"off"``        — never continue.
+      * ``"codex_only"`` — historical scope: continue only on the
+        ``codex_responses`` api_mode, and only for codebase/workspace acks
+        (``require_workspace=True``).
+      * ``"all"``        — user opted in for every api_mode; continue on any
+        future-ack + action verb (``require_workspace=False``).
+
+    Mirrors the four-mode shape of ``agent.tool_use_enforcement``: ``"auto"``
+    (default) → codex_only; ``True``/"true"/"always"/"yes"/"on" → all;
+    ``False``/"false"/"never"/"no"/"off" → off; ``list`` → all when a substring
+    matches the active model name, else off.
+    """
+    mode = getattr(agent, "_intent_ack_continuation", "auto")
+
+    if mode is True or (isinstance(mode, str) and mode.lower() in {"true", "always", "yes", "on"}):
+        return "all"
+    if mode is False or (isinstance(mode, str) and mode.lower() in {"false", "never", "no", "off"}):
+        return "off"
+    if isinstance(mode, list):
+        model_lower = (agent.model or "").lower()
+        return "all" if any(p.lower() in model_lower for p in mode if isinstance(p, str)) else "off"
+    # "auto" or any unrecognised value — historical codex-only behavior.
+    return "codex_only" if agent.api_mode == "codex_responses" else "off"
+
+
+def intent_ack_continuation_enabled(agent) -> bool:
+    """Whether intent-ack continuation should fire at all for this turn.
+
+    The ``codex_ack_continuations < 2`` per-turn cap and the
+    ``looks_like_codex_intermediate_ack`` detector are applied by the caller;
+    this only decides the on/off gate. Callers that also need to know whether
+    the workspace requirement applies should use ``intent_ack_continuation_mode``
+    directly (``"codex_only"`` ⇒ require_workspace=True, ``"all"`` ⇒ False).
+    """
+    return intent_ack_continuation_mode(agent) != "off"
 
 
 
