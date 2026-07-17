@@ -34,6 +34,7 @@ import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
 import { canImportHermesCli, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
+import { shouldLatchBackendStartFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
 import {
@@ -101,6 +102,7 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import { ensureMainWindow } from './main-window-lifecycle'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import {
@@ -6170,6 +6172,16 @@ function globalRemoteActive() {
   return modeIsRemoteLike(readDesktopConnectionConfig().mode)
 }
 
+// True when the PRIMARY profile's backend resolves to a remote/cloud host —
+// i.e. resolveRemoteBackend(primaryProfileKey()) would return a descriptor
+// rather than null. Mirrors that function's precedence (per-profile override →
+// env → global) so a startHermes() failure can be classified as remote (never
+// latch — transient, must stay retryable) vs local (latch to break install
+// loops) BEFORE the throwing resolve/mint runs.
+function primaryBackendIsRemote() {
+  return Boolean(profileHasRemoteOverride(primaryProfileKey())) || globalRemoteActive()
+}
+
 // GET a profile's resolved backend (remote pool or local primary), parsed JSON.
 async function fetchJsonForProfile(profile, path) {
   return requestJsonForProfile(profile, path, 'GET')
@@ -6737,10 +6749,17 @@ async function startHermes() {
 
   const connectionAttempt = backendConnectionState.startAttempt()
 
+  // Classify this boot BEFORE the throwing resolve/mint runs: a remote failure
+  // must NOT latch (it's transient — see shouldLatchBackendStartFailure), while
+  // a local failure latches to break install-restart loops.
+  let attemptedRemote = primaryBackendIsRemote()
+
   const connectionPromise = (async () => {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
+    // Re-read once resolved so the classification tracks the value actually used.
+    attemptedRemote = primaryBackendIsRemote()
     const remote = await resolveRemoteBackend(primaryProfileKey())
 
     if (remote) {
@@ -6946,7 +6965,16 @@ async function startHermes() {
     }
 
     const message = error instanceof Error ? error.message : String(error)
-    backendStartFailure = error instanceof Error ? error : new Error(message)
+
+    // Only latch LOCAL boot failures. A remote failure (lapsed session / mint
+    // timeout / host briefly unreachable across sleep) is transient and has no
+    // child 'exit' handler to clear the cache — latching it would wedge the app
+    // on "session expired" until a full restart, defeating reconnect, the
+    // "Sign out & sign in" reload, and the wake-recovery revalidate path.
+    if (shouldLatchBackendStartFailure({ attemptedRemote })) {
+      backendStartFailure = error instanceof Error ? error : new Error(message)
+    }
+
     updateBootProgress(
       {
         error: message,
@@ -6981,8 +7009,9 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
 
   if (zoom) {
     installZoomShortcuts(win)
-    // Re-apply persisted zoom on show/restore (Windows drops webContents zoom on
-    // minimize/restore) and on first load (reloads / crash recovery).
+    // Re-apply persisted zoom on show/restore/cross-display move (Windows can
+    // drop webContents zoom after minimize or a monitor-scale change) and on
+    // first load (reloads / crash recovery).
     installZoomReassertOnWindowEvents(win, () => restorePersistedZoomLevel(win))
     win.webContents.once('did-finish-load', () => restorePersistedZoomLevel(win))
   }
@@ -7308,10 +7337,17 @@ function createWindow() {
   mainWindow.on('unmaximize', schedulePersistWindowState)
   mainWindow.on('close', () => schedulePersistWindowState.flush())
 
-  // The overlay rides the main window — closing the app's primary window must
-  // tear it down too (otherwise it strands as an orphan that blocks
-  // window-all-closed from quitting on Windows/Linux).
-  mainWindow.on('closed', () => closePetOverlay())
+  // the closed wrapper remains truthy, so clear only the window this callback owns.
+  const createdMainWindow = mainWindow
+  mainWindow.on('closed', () => {
+    closePetOverlay()
+
+    if (mainWindow === createdMainWindow) {
+      mainWindow = null
+      // the replacement renderer must register before queued links can be delivered.
+      _rendererReadyForDeepLink = false
+    }
+  })
 
   wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
 
@@ -9098,13 +9134,15 @@ if (!_gotSingleInstanceLock) {
 
     if (url) {
       handleDeepLink(url)
-    } else if (mainWindow) {
-      if (mainWindow.isMinimized()) {
-        mainWindow.restore()
-      }
-
-      mainWindow.focus()
     }
+
+    ensureMainWindow(mainWindow, {
+      isReady: app.isReady(),
+      createWindow,
+      focusWindow,
+      // deep-link delivery focuses a live window after its renderer is ready.
+      focusExisting: !url
+    })
   })
 }
 
