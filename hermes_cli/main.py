@@ -1304,13 +1304,49 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             return None
 
 
+def _resolve_workspace_key() -> Optional[str]:
+    """The current workspace identity for cwd-scoped resume.
+
+    Git repo root when CWD is inside a repo (so all sessions across its
+    subdirs/worktrees group together), else the CWD itself. Returns None when
+    neither can be determined — callers fall back to the global MRU then.
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.abspath(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        return os.getcwd()
+    except Exception:
+        return None
+
+
 def _resolve_last_session(source: str = "cli") -> Optional[str]:
-    """Look up the most recently-used session ID for a source."""
+    """Look up the most recently-used session ID for a source.
+
+    Scoped to the current workspace first (git repo root, else cwd) so
+    ``hermes -c`` from repo A continues repo A's last session rather than the
+    global MRU. Falls back to the unscoped MRU when no session matches the
+    current workspace, preserving the old behaviour for fresh directories.
+    """
     db = None
     try:
         from hermes_state import SessionDB
 
         db = SessionDB()
+        ws_key = _resolve_workspace_key()
+        if ws_key:
+            sessions = db.search_sessions(source=source, limit=1, workspace_key=ws_key)
+            if sessions:
+                return sessions[0]["id"]
+        # Fallback: global MRU for this source.
         sessions = db.search_sessions(source=source, limit=1)
         return sessions[0]["id"] if sessions else None
     except Exception:
@@ -16201,7 +16237,7 @@ def main():
         p.add_argument(
             "--newer-than",
             metavar="AGE",
-            help="Only match sessions started within the last AGE "
+            help="Only match sessions active within the last AGE "
             "(e.g. '5h', '2d') or after an ISO timestamp",
         )
         p.add_argument(
@@ -17358,12 +17394,14 @@ def main():
                 print(f"No sessions match ({describe_filters(filters)}).")
                 return
 
-            # Candidates are ordered oldest-first — surface the age span so
-            # the confirmation makes the blast radius obvious.
-            _oldest = candidates[0].get("started_at")
-            _newest = candidates[-1].get("started_at")
+            # Candidates are ordered by activity oldest-first. Surface that
+            # span so a long-lived but recently used conversation cannot look
+            # old merely because of its creation date.
+            _oldest = candidates[0].get("last_active")
+            _newest = candidates[-1].get("last_active")
             _span = (
-                f"oldest {format_epoch(_oldest)}, newest {format_epoch(_newest)}"
+                f"oldest activity {format_epoch(_oldest)}, "
+                f"newest activity {format_epoch(_newest)}"
             )
 
             if args.dry_run or not args.yes:
@@ -17376,7 +17414,7 @@ def main():
                     title = (s.get("title") or "")[:36]
                     model = (s.get("model") or "-").split("/")[-1][:24]
                     print(
-                        f"  {s['id']}  {format_epoch(s['started_at']):<17} "
+                        f"  {s['id']}  {format_epoch(s.get('last_active')):<17} "
                         f"{s['source']:<10} {model:<24} "
                         f"{s['message_count']:>4} msgs  {title}"
                     )
