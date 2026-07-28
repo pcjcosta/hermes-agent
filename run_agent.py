@@ -149,7 +149,6 @@ from agent.memory_manager import sanitize_context
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
-from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -964,12 +963,6 @@ class AIAgent:
             from agent.conversation_compression import (
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
             )
-            # cooldown + anti-thrash (ineffective) are both "compression blocked".
-            if _warn_kind in ("cooldown", "ineffective"):
-                self._touch_activity(
-                    f"compression blocked ({reason})",
-                    provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
-                )
             self._emit_warning(
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
                     tokens=preflight_tokens,
@@ -2692,17 +2685,16 @@ class AIAgent:
         retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
-        # Lazy module import (not from-import) so tests that
-        # ``monkeypatch.setattr("hermes_cli.plugins.has_hook", ...)`` still
-        # take effect on this call site. After first call the import is a
+        # Lazy module import (not from-import) so tests can replace lifecycle
+        # dispatch at this call site. After first call the import is a
         # ``sys.modules`` dict lookup, so retries don't repay any real cost.
         try:
-            from hermes_cli import plugins as _plugins
+            from hermes_cli import lifecycle as _lifecycle
 
-            if not _plugins.has_hook("api_request_error"):
+            if not _lifecycle.has_hook("api_request_error"):
                 return
             ended_at = time.time()
-            _plugins.invoke_hook(
+            _lifecycle.invoke_hook(
                 "api_request_error",
                 task_id=task_id,
                 turn_id=turn_id,
@@ -3469,12 +3461,7 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
-    def _touch_activity(
-        self,
-        desc: str,
-        *,
-        provenance: Optional[ActivityProvenance] = None,
-    ) -> None:
+    def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
         Also bridges to the kanban board's heartbeat fields when this
@@ -3482,23 +3469,9 @@ class AIAgent:
         so the dispatcher watchdog doesn't reclaim an actively-running
         worker as stale (#31752). Bridge is rate-limited (60s) and
         best-effort — it never raises into the agent loop.
-
-        Separately, rate-limits a durable SessionDB activity projection
-        (``last_activity_at`` + bounded description/provenance) so
-        CLI/Gateway consumers share one observation source (#72016 / #72039).
-
-        ``provenance`` defaults to ``unknown`` (the ordinary agent activity
-        clock). Named values are for special writers (e.g. compression);
-        ordinary call sites should leave the default.
         """
-        from agent.session_activity import (
-            bound_activity_description,
-            normalize_activity_provenance,
-        )
-
         self._last_activity_ts = time.time()
-        self._last_activity_desc = bound_activity_description(desc)
-        self._last_activity_provenance = normalize_activity_provenance(provenance)
+        self._last_activity_desc = desc
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -3509,66 +3482,6 @@ class AIAgent:
                 # covers import-time failures (kanban_tools unavailable,
                 # etc.) on niche deployment surfaces.
                 pass
-        self._persist_session_activity_if_due()
-
-    def _persist_session_activity_if_due(self) -> None:
-        """Best-effort durable activity heartbeat for SessionDB consumers.
-
-        Rate-limited to one write per 60s per agent (same cadence as the
-        kanban auto-heartbeat). Fail-open: never raises into the agent loop.
-        """
-        session_id = getattr(self, "session_id", None)
-        session_db = getattr(self, "_session_db", None)
-        if not session_id or session_db is None:
-            return
-        touch = getattr(session_db, "touch_session_activity", None)
-        if not callable(touch):
-            return
-        now_mono = time.monotonic()
-        last_mono = getattr(self, "_session_activity_last_persist_mono", 0.0)
-        if (now_mono - last_mono) < 60.0:
-            return
-        self._session_activity_last_persist_mono = now_mono
-        try:
-            from agent.session_activity import normalize_activity_provenance
-
-            touch(
-                session_id,
-                getattr(self, "_last_activity_ts", None),
-                description=getattr(self, "_last_activity_desc", None),
-                provenance=normalize_activity_provenance(
-                    getattr(self, "_last_activity_provenance", None)
-                ),
-            )
-        except Exception:
-            # Never let durable heartbeat I/O break the agent loop.
-            pass
-
-    def _reset_activity_labels_after_turn(self) -> None:
-        """Drop mid-turn activity labels once the turn is no longer running.
-
-        Keeps ``_last_activity_ts`` so idle/watchdog clocks stay continuous
-        across interrupt-recursive turns (#15654) and between turns. Clears
-        description + provenance so idle cached agents / SessionDB listings
-        do not keep advertising the last mid-turn stamp (e.g. compression
-        or tool execution) after the turn ended (#72039).
-        """
-        from agent.session_activity import ActivityProvenance
-
-        self._last_activity_desc = ""
-        self._last_activity_provenance = ActivityProvenance.UNKNOWN
-        session_id = getattr(self, "session_id", None)
-        session_db = getattr(self, "_session_db", None)
-        if not session_id or session_db is None:
-            return
-        clear = getattr(session_db, "clear_session_activity_labels", None)
-        if not callable(clear):
-            return
-        try:
-            clear(session_id)
-        except Exception:
-            # Never let durable cleanup I/O break turn teardown.
-            pass
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -3780,32 +3693,20 @@ class AIAgent:
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
-        Exposes the shared activity observation contract
-        (``last_activity_at`` / ``last_activity_description`` /
-        ``last_activity_provenance``) plus short aliases
-        (``last_activity_ts`` / ``last_activity_desc`` / …) for existing
-        gateway and delegate readers.
+        Called by the gateway timeout handler to report what the agent was doing
+        when it was killed, and by the periodic "still working" notifications.
         """
-        from agent.session_activity import (
-            ActivityProvenance,
-            build_activity_snapshot,
-        )
-
-        provenance = getattr(self, "_last_activity_provenance", None)
-        if provenance is None:
-            provenance = ActivityProvenance.UNKNOWN
-        return build_activity_snapshot(
-            last_activity_at=getattr(self, "_last_activity_ts", None),
-            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
-            last_activity_provenance=provenance,
-            extra={
-                "current_tool": self._current_tool,
-                "api_call_count": self._api_call_count,
-                "max_iterations": self.max_iterations,
-                "budget_used": self.iteration_budget.used,
-                "budget_max": self.iteration_budget.max_total,
-            },
-        )
+        elapsed = time.time() - self._last_activity_ts
+        return {
+            "last_activity_ts": self._last_activity_ts,
+            "last_activity_desc": self._last_activity_desc,
+            "seconds_since_activity": round(elapsed, 1),
+            "current_tool": self._current_tool,
+            "api_call_count": self._api_call_count,
+            "max_iterations": self.max_iterations,
+            "budget_used": self.iteration_budget.used,
+            "budget_max": self.iteration_budget.max_total,
+        }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
@@ -5185,6 +5086,11 @@ class AIAgent:
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
                 self._client_kwargs.get("api_key", "")
             )
+        elif base_url_host_matches(base_url, "x.ai"):
+            # Cover both provider=xai and provider=xai-oauth (api.x.ai).
+            from tools.xai_http import hermes_xai_default_headers
+
+            self._client_kwargs["default_headers"] = hermes_xai_default_headers()
         else:
             # No URL-specific headers — check profile.default_headers before clearing.
             _ph_headers = None
@@ -5422,7 +5328,6 @@ class AIAgent:
                         pass
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
-        self._current_streamed_reasoning_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -5763,15 +5668,6 @@ class AIAgent:
                 cb(text)
             except Exception:
                 pass
-            else:
-                # Only checkpoint reasoning that a surface actually displayed.
-                # show_reasoning=false leaves the callback unset, so hidden
-                # provider thinking never becomes visible transcript content.
-                if isinstance(text, str) and text:
-                    self._current_streamed_reasoning_text = (
-                        getattr(self, "_current_streamed_reasoning_text", "")
-                        + text
-                    )
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
@@ -6695,11 +6591,7 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
-        from agent.conversation_compression import (
-            compress_context,
-            resolve_context_compression_timeouts,
-            run_compress_context_with_progress_timeout,
-        )
+        from agent.conversation_compression import compress_context
         from agent.portal_tags import (
             get_conversation_context,
             reset_conversation_context,
@@ -6725,112 +6617,13 @@ class AIAgent:
             if root:
                 token = set_conversation_context(root)
         try:
-            def _run(fence=None):
-                return compress_context(
-                    self, messages, system_message,
-                    approx_tokens=approx_tokens, task_id=task_id,
-                    focus_topic=focus_topic,
-                    force=force,
-                    defer_context_engine_notification=(
-                        defer_context_engine_notification
-                    ),
-                    commit_fence=fence,
-                )
-
-            # Callers that already own a progress-aware wait (gateway session
-            # hygiene) pass commit_fence and must not be double-wrapped.
-            if commit_fence is not None:
-                return _run(commit_fence)
-
-            idle_timeout, total_ceiling = resolve_context_compression_timeouts()
-            if idle_timeout <= 0:
-                return _run(None)
-
-            # Resolve the fallback prompt lazily on timeout only. Eager
-            # rebuild here would raise before compress_context runs whenever
-            # _cached_system_prompt is unset and _build_system_prompt fails
-            # (lock-refresher / noop-exception tests rely on that path).
-            def _fallback_prompt():
-                cached = getattr(self, "_cached_system_prompt", None)
-                if cached:
-                    return cached
-                try:
-                    return self._build_system_prompt(system_message)
-                except Exception:
-                    logger.debug(
-                        "compress_context timeout fallback prompt rebuild "
-                        "failed; using raw system_message",
-                        exc_info=True,
-                    )
-                    return system_message or ""
-
-            def _on_timeout(idle, waited, since_progress):
-                logger.warning(
-                    "Context compression made no progress for %.1fs "
-                    "(total wait %.1fs, ceiling %.1fs); continuing without "
-                    "compression",
-                    since_progress,
-                    waited,
-                    total_ceiling,
-                )
-                touch = getattr(self, "_touch_activity", None)
-                if callable(touch):
-                    try:
-                        touch(
-                            "context compression timed out",
-                            provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "compress_context timeout activity touch failed",
-                            exc_info=True,
-                        )
-                # Same timeout cooldown ladder as summary-LLM timeouts
-                # (#62452): avoid re-burning the full idle budget every turn.
-                compressor = getattr(self, "context_compressor", None)
-                if compressor is not None:
-                    record = getattr(compressor, "record_timeout_failure", None)
-                    if callable(record):
-                        try:
-                            record(
-                                "host compress_context timeout "
-                                "(no summary progress)"
-                            )
-                        except Exception:
-                            logger.debug(
-                                "failed to record compress_context timeout "
-                                "cooldown",
-                                exc_info=True,
-                            )
-                emit = getattr(self, "_emit_warning", None)
-                if callable(emit):
-                    emit(
-                        "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
-                        "compression. Run /compress to retry, /new for a clean "
-                        "session, or check auxiliary.compression."
-                    )
-
-            result = run_compress_context_with_progress_timeout(
-                worker=_run,
-                messages=messages,
-                system_prompt_fallback=_fallback_prompt,
-                idle_timeout_seconds=idle_timeout,
-                total_ceiling_seconds=total_ceiling,
-                on_timeout=_on_timeout,
+            return compress_context(
+                self, messages, system_message,
+                approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
+                force=force,
+                defer_context_engine_notification=defer_context_engine_notification,
+                commit_fence=commit_fence,
             )
-            # compress_context ran on a daemon pool worker thread; the session
-            # id rotation updated hermes_logging._session_context (a
-            # threading.local) on the WORKER thread, not this one. Propagate
-            # the current session_id back so subsequent log lines on this
-            # thread carry the rotated id (#34089).
-            try:
-                from hermes_logging import set_session_context
-                set_session_context(self.session_id)
-            except Exception:
-                pass
-            return result
         finally:
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
@@ -6955,7 +6748,8 @@ class AIAgent:
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
                      skip_tool_request_middleware: bool = False,
-                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None) -> str:
+                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
+                     skip_tool_execution_middleware: bool = False) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
@@ -6968,6 +6762,7 @@ class AIAgent:
             pre_tool_block_checked,
             skip_tool_request_middleware,
             tool_request_middleware_trace,
+            skip_tool_execution_middleware,
         )
 
     @staticmethod
@@ -7055,54 +6850,140 @@ class AIAgent:
             reset_accounting_context,
             set_accounting_context,
         )
+        from agent import relay_runtime
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
         )
-        from agent.subagent_lifecycle import bind_subagent_parent
-
-        # Publish the conversation id for ambient Nous Portal tagging. Every
-        # LLM call made inside this turn — main loop, compression, vision,
-        # web_extract, session_search, MoA slots, background-review forks
-        # (which copy this Context into their thread) — inherits the
-        # ``conversation=<root>`` tag with zero per-call-site plumbing.
-        token = set_conversation_context(self._conversation_root_id())
-        # Publish the session accounting handles the same way so auxiliary
-        # calls record their token usage into session_model_usage (task
-        # dimension) — the fix for aux spend being invisible in analytics
-        # (issue #23270).
-        acct_token = set_accounting_context(
-            getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        from hermes_cli.observability.relay_shared_metrics import (
+            finish_task_run,
+            start_task_run,
         )
-        from agent.auxiliary_client import scoped_runtime_main
+        from agent.subagent_lifecycle import bind_subagent_parent
+        effective_task_id = task_id or str(uuid.uuid4())
+        session_id = str(getattr(self, "session_id", None) or "")
+        task_context = {
+            "session_id": session_id,
+            "task_id": effective_task_id,
+            "platform": getattr(self, "platform", None) or "",
+        }
+        relay_turn_id = (
+            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        )
+        self._relay_pending_turn_id = relay_turn_id
+        relay_parent_session_id = (
+            str(getattr(self, "_parent_session_id", None) or "")
+            if task_context["platform"] == "subagent"
+            else ""
+        )
+        relay_lease = None
+        relay_turn = None
+        token = None
+        acct_token = None
+        task_started = False
+        task_finished = False
+        relay_outcome = "failed"
+        try:
+            relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
+                profile_key=relay_runtime.current_profile_key(),
+                session_id=task_context["session_id"],
+                platform=task_context["platform"],
+                parent_session_id=relay_parent_session_id,
+                model=str(getattr(self, "model", None) or ""),
+            )
+            relay_turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
+                relay_lease,
+                turn_id=relay_turn_id,
+                task_id=effective_task_id,
+            )
+            start_task_run(
+                **task_context,
+                parent_session_id=getattr(self, "_parent_session_id", None) or "",
+            )
+            task_started = True
+            # Publish the conversation id for ambient Nous Portal tagging. Every
+            # LLM call made inside this turn — main loop, compression, vision,
+            # web_extract, session_search, MoA slots, background-review forks
+            # (which copy this Context into their thread) — inherits the
+            # ``conversation=<root>`` tag with zero per-call-site plumbing.
+            token = set_conversation_context(self._conversation_root_id())
+            # Publish the session accounting handles the same way so auxiliary
+            # calls record their token usage into session_model_usage (task
+            # dimension) — the fix for aux spend being invisible in analytics
+            # (issue #23270).
+            acct_token = set_accounting_context(
+                getattr(self, "_session_db", None),
+                getattr(self, "session_id", None),
+            )
+            from agent.auxiliary_client import scoped_runtime_main
 
-        # The outer token restores the caller's Context even though turn setup
-        # replaces the value with the live runtime after fallback restoration.
-        # Keep the scope local instead of storing ContextVar tokens on the agent,
-        # which may be observed from another thread.
-        with bind_subagent_parent(self), scoped_runtime_main({}):
-            try:
-                return run_conversation(
+            # The outer token restores the caller's Context even though turn setup
+            # replaces the value with the live runtime after fallback restoration.
+            # Keep the scope local instead of storing ContextVar tokens on the agent,
+            # which may be observed from another thread.
+            with bind_subagent_parent(self), scoped_runtime_main({}):
+                result = run_conversation(
                     self,
                     user_message,
                     system_message,
                     conversation_history,
-                    task_id,
+                    effective_task_id,
                     stream_callback,
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
                 )
+            terminal = result if isinstance(result, dict) else {}
+            if terminal.get("interrupted") is True:
+                relay_outcome = "cancelled"
+            elif terminal.get("failed") is True:
+                relay_outcome = "failed"
+            else:
+                relay_outcome = "success"
+            relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
+                relay_turn,
+                outcome=relay_outcome,
+            )
+            task_finished = True
+            finish_task_run(**task_context, result=result)
+            return result
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
+                type(exc).__name__ == "CancelledError"
+            ):
+                relay_outcome = "cancelled"
+            elif isinstance(exc, TimeoutError):
+                relay_outcome = "timed_out"
+            if relay_turn is not None:
+                relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
+                    relay_turn,
+                    outcome=relay_outcome,
+                )
+            if task_started and not task_finished:
+                task_finished = True
+                finish_task_run(**task_context, error=exc)
+            raise
+        finally:
+            try:
+                if relay_turn is not None:
+                    relay_runtime.SESSION_COORDINATOR.end_turn(
+                        relay_turn,
+                        outcome=relay_outcome,
+                    )
             finally:
-                # Always clear mid-turn labels when the turn exits — including
-                # interrupted early returns that skip finalize_turn. Keep ts.
                 try:
-                    self._reset_activity_labels_after_turn()
-                except Exception:
-                    pass
-                reset_accounting_context(acct_token)
-                reset_conversation_context(token)
+                    if relay_lease is not None:
+                        relay_runtime.SESSION_COORDINATOR.release_conversation(
+                            relay_lease
+                        )
+                finally:
+                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                        self._relay_pending_turn_id = None
+                    if acct_token is not None:
+                        reset_accounting_context(acct_token)
+                    if token is not None:
+                        reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
