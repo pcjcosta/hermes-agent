@@ -3220,6 +3220,7 @@ def cmd_chat(args):
         "checkpoints": getattr(args, "checkpoints", False),
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
+        "run_budget": getattr(args, "run_budget", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
@@ -8834,6 +8835,15 @@ def _reexec_update_off_windows_shim() -> bool:
     prints its own result, and ``--gateway`` writes the true exit code to
     ``.update_exit_code`` for the gateway watcher before restarting.
 
+    It also runs unattended, with stdin closed. The child inherits the
+    console, so left alone ``sys.stdin.isatty()`` still reports a terminal and
+    the update asks its local-changes question — but this process has already
+    exited and the shell has taken the console back, so the prompt cannot be
+    answered and the update hangs forever. Closing stdin makes the update take
+    the same path it takes for the gateway and Desktop: honour
+    ``updates.non_interactive_local_changes`` (stash by default, nothing lost)
+    and keep going.
+
     Anything that stops the hand-off (no venv python, spawn refused) falls
     through to the old in-process behaviour with the manual command printed,
     so a broken venv still gets whatever the update can do rather than a
@@ -8851,12 +8861,19 @@ def _reexec_update_off_windows_shim() -> bool:
     cmd = [str(python_exe), "-m", "hermes_cli.main", *sys.argv[1:]]
     if python_exe.is_file():
         try:
-            subprocess.Popen(cmd, env={**os.environ, _UPDATE_REEXEC_ENV: "1"})
+            subprocess.Popen(
+                cmd,
+                env={**os.environ, _UPDATE_REEXEC_ENV: "1"},
+                stdin=subprocess.DEVNULL,
+            )
             print(
                 f"→ Windows: {shim.name} cannot replace itself while it runs; "
                 "continuing the update under the venv Python."
             )
-            print("  Progress continues below; this shell returns immediately.")
+            print(
+                "  It runs unattended from here — progress prints below and "
+                "this shell returns right away."
+            )
             return True
         except OSError as exc:
             logger.debug("Update re-exec via %s failed: %s", python_exe, exc)
