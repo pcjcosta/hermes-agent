@@ -28,6 +28,7 @@ from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
 
 from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity
+from hermes_state_holders import read_only_db_uri
 from hermes_state_errors import (
     _DELETED_WAL_GENERATION_MSG, _DISK_IO_ERROR_MARKER, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
     _STATE_DB_REPLACED_MSG, DeletedWalGenerationError, SessionCompressionInProgressError, StateDbCorruptError,
@@ -36,7 +37,7 @@ from hermes_state_errors import (
 )
 from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
-    _set_last_init_error, get_last_init_error,
+    _register_test_instance, _set_last_init_error, get_last_init_error,
 )
 from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
 from hermes_state_sessions import SessionSessionsMixin
@@ -561,6 +562,10 @@ class SessionDB(
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+            else:
+                # Test-isolation runs only (gated inside the helper): register
+                # for the suite-level leak sweep in tests/conftest.py.
+                _register_test_instance(self)
 
     def _open_writer(self) -> None:
         """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
@@ -643,7 +648,7 @@ class SessionDB(
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
         are borrowed by whichever thread reads next; exclusive ownership is enforced by pool checkout."""
         conn = _connect_tracked_db(
-            f"file:{self.db_path}?mode=ro", tracking_path=self.db_path, uri=True,
+            read_only_db_uri(self.db_path), tracking_path=self.db_path, uri=True,
             check_same_thread=False, timeout=timeout, isolation_level=None,
         )
         conn.row_factory = sqlite3.Row

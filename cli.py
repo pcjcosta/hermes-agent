@@ -171,7 +171,7 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import base_url_host_matches, base_url_hostname, fast_safe_load
+from utils import base_url_host_matches, base_url_hostname, fast_safe_load, is_truthy_value
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -2769,7 +2769,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self.checkpoint_max_file_size_mb = cp_cfg.get("max_file_size_mb", 10)
         self.pass_session_id = pass_session_id
         # --ignore-rules: AIAgent skips context files (AGENTS.md/SOUL.md/...) and memory.
-        self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        self.ignore_rules = ignore_rules or is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
 
     def _init_prompt_and_reasoning(self, reasoning):
         """Ephemeral system prompt/prefill, reasoning + service tier, OpenRouter routing knobs, fallback chain."""
@@ -2932,6 +2932,9 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._prompt_stash = _PromptStash()
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
+        # skills.auto_load rendered in the preload thread; None until joined. Handed to every
+        # agent this CLI builds so the prompt bytes never depend on when the agent was created.
+        self._auto_load_skills_result: Optional[tuple] = None
         # Background --skills preload, joined by finalize_preloaded_skills before any agent is built.
         self._preload_skills_thread: Optional[threading.Thread] = None
         self._preload_skills_result: Optional[tuple] = None
@@ -3080,6 +3083,11 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         err = getattr(self, "_preload_skills_error", None)
         if err is not None:
             raise err
+        auto_result = getattr(self, "_auto_load_skills_result", None)
+        if auto_result and auto_result[2]:
+            logger.warning("skills.auto_load: skill(s) not found or disabled, skipped: %s", ", ".join(auto_result[2]))
+        # auto_load names first, then explicit -s names that were not already pinned.
+        self.preloaded_skills = list(auto_result[1]) if auto_result else []
         result = getattr(self, "_preload_skills_result", None)
         if not result:
             return
@@ -3099,7 +3107,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
                 raise ValueError(f"Unknown skill(s): {missing_display}")
         if skills_prompt:
             self.system_prompt = "\n\n".join(p for p in (self.system_prompt, skills_prompt) if p).strip()
-            self.preloaded_skills = loaded_skills
+        self.preloaded_skills += [name for name in loaded_skills if name not in self.preloaded_skills]
 
     def _show_tool_availability_warnings(self):
         """Warn about tools disabled by missing API keys (not system deps)."""
@@ -4077,8 +4085,9 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
-def _run_quiet_single_query(cli, effective_query):
+def _run_quiet_single_query(cli, effective_query, emitter=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
+    With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it.
     Nested Bot Mode notifies bind this session's key (not the dispatcher's) and resume in-process
     before stdout is printed, so a teammate reply is the quiet run's final answer rather than a
@@ -4098,6 +4107,8 @@ def _run_quiet_single_query(cli, effective_query):
             )
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
+            if emitter is not None:
+                sys.exit(emitter.emit_result({"failed": True, "error": "Interrupted"}, session_id=cli.session_id or "", exit_code=130))
             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
             sys.exit(130)
         # The exit line below reports session_id to stderr for automation wrappers;
@@ -4138,7 +4149,9 @@ def _run_quiet_single_query(cli, effective_query):
         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
-    if (
+    if emitter is not None:
+        pass  # the result record below carries text/error; nothing else may touch stdout
+    elif (
         not response and isinstance(result, dict) and result.get("error")
         and (result.get("failed") or result.get("partial"))
     ):
@@ -4154,7 +4167,8 @@ def _run_quiet_single_query(cli, effective_query):
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 
-    print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+    if emitter is None:
+        print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
     # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
@@ -4168,6 +4182,8 @@ def _run_quiet_single_query(cli, effective_query):
                 _exit_code = _RL_CODE
             except Exception:
                 _exit_code = 1
+    if emitter is not None:
+        _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
     sys.exit(_exit_code)
 
 
@@ -4337,18 +4353,29 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             sys.exit(1)
         raise
 
-    if parsed_skills:
+    # skills.auto_load rides the same background preload as -s; --ignore-rules skips it with
+    # the rest of the auto-injected context. Resolved here (not lazily in the agent) so the
+    # session id is real for ${HERMES_SESSION_ID} and -s can dedupe against it.
+    from agent.skill_commands import build_auto_load_prompt, resolve_auto_load_skills
+    auto_load_names = [] if getattr(cli, "ignore_rules", ignore_rules) else resolve_auto_load_skills(CLI_CONFIG)
+    if not auto_load_names:
+        cli._auto_load_skills_result = ("", [], [])
+    if parsed_skills or auto_load_names:
         # Load the skill payloads in the background: skill_view walks the full skills
         # tree per skill (~0.5s for a large library) and the result is only consumed
         # at agent init, not by the banner. finalize_preloaded_skills() joins the
         # thread before any consumer reads cli.system_prompt.
         def _load_preloaded_skills() -> None:
             try:
-                cli._preload_skills_result = build_preloaded_skills_prompt(parsed_skills, task_id=cli.session_id)
+                if auto_load_names:
+                    cli._auto_load_skills_result = build_auto_load_prompt(task_id=cli.session_id, user_config=CLI_CONFIG)
+                if parsed_skills:
+                    cli._preload_skills_result = build_preloaded_skills_prompt(
+                        parsed_skills, task_id=cli.session_id, excluded_loaded_names=set(cli._auto_load_skills_result[1]))
             except Exception as exc:  # surfaced by finalize
                 cli._preload_skills_error = exc
 
-        cli._preload_skills_requested = parsed_skills
+        cli._preload_skills_requested = [*auto_load_names, *(s for s in parsed_skills if s not in auto_load_names)]
         cli._preload_skills_thread = threading.Thread(target=_load_preloaded_skills, name="skills-preload", daemon=True)
         cli._preload_skills_thread.start()
     return cli
@@ -4435,8 +4462,9 @@ def _configure_quiet_agent(agent) -> None:
     agent.tool_progress_mode = "off"
 
 
-def _run_single_query_mode(cli, query, image, quiet, oneshot):
-    """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit."""
+def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool = False):
+    """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit.
+    ``stream_json`` (implies quiet) swaps the plain-text final answer for the JSONL event protocol."""
     if _should_seed_interactive(query, image, quiet, oneshot):
         seeded_query, seeded_images = _collect_query_images(query, image)
         logger.info(
@@ -4463,6 +4491,12 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         if quiet:
             # Quiet mode: suppress banner, spinner, tool previews.
             cli.tool_progress_mode = "off"
+            emitter = None
+            if stream_json:
+                # Built BEFORE credentials/agent init so a failed start still closes the protocol
+                # (init + result) instead of exiting 1 with an empty stdout.
+                from hermes_cli.stream_json import StreamJsonEmitter
+                emitter = StreamJsonEmitter(model=getattr(cli, "model", "") or "", session_id=cli.session_id or "")
             if cli._ensure_runtime_credentials():
                 effective_query: Any = _route_single_query_images(
                     cli, query, query, single_query_images, single_query_image_urls
@@ -4476,8 +4510,13 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
                     request_overrides=turn_route.get("request_overrides"),
                 ):
                     _configure_quiet_agent(cli.agent)
-                    _run_quiet_single_query(cli, effective_query)
+                    if emitter is not None:
+                        emitter.attach(cli.agent)
+                    _run_quiet_single_query(cli, effective_query, emitter=emitter)
 
+            if emitter is not None:
+                emitter.emit_result({"failed": True, "error": "credentials or agent init failed"},
+                                    session_id=cli.session_id or "", exit_code=1)
             sys.exit(1)  # credentials or agent init failed
         # No welcome banner (~420 ms cold); session id / resume hint come from _print_exit_summary().
         _query_label = query or ("[image attached]" if single_query_images else "")
@@ -4515,6 +4554,7 @@ def main(
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
+    output_format: str = "text",
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
 ):
@@ -4573,6 +4613,11 @@ def main(
 
     _join_worktree = _start_worktree_setup(list_tools, list_toolsets, worktree, w)
     query = query or q
+    # ``hermes chat`` already validated this; the direct Fire entry point gets the same contract.
+    if output_format == "stream-json":
+        if not query:
+            raise ValueError("--format stream-json requires -q/--query")
+        quiet = True
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
                                verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
 
@@ -4602,7 +4647,7 @@ def main(
     _install_single_query_signal_handlers(cli)
 
     if query or image:
-        _run_single_query_mode(cli, query, image, quiet, oneshot)
+        _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json=output_format == "stream-json")
         return
     cli.run()
 
