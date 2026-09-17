@@ -1847,7 +1847,7 @@ def _lower_threshold_to_aux_context(
             f"{recomputed_threshold:,} tokens, still above the compression model's {aux_context:,}.)"
         )
     agent._compression_warning = msg
-    agent._emit_status(msg)
+    agent._emit_diagnostic_status(msg)
     logger.warning(
         "Auxiliary compression model %s has %d token context, below the main model's compression threshold of %d "
         "tokens — auto-lowered session threshold to %d to keep compression working.", aux_model, aux_context,
@@ -1904,7 +1904,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
                     "long chats, so older messages will be cut without a summary. Run `hermes setup` to add one."
                 )
             agent._compression_warning = msg
-            agent._emit_status(msg)
+            agent._emit_diagnostic_status(msg)
             logger.warning("No auxiliary LLM provider for compression — summaries will be unavailable.")
             return
         aux_base_url = str(getattr(client, "base_url", ""))
@@ -1958,8 +1958,10 @@ def replay_compression_warning(agent: Any) -> None:
     ``__init__``) is finally wired."""
     msg = getattr(agent, "_compression_warning", None)
     if msg and agent.status_callback:
+        # Replayed as a classified diagnostic so every sink applies its own policy snapshot.
+        from gateway.warning_notifications import DiagnosticText
         with contextlib.suppress(Exception):
-            agent.status_callback("lifecycle", msg)
+            agent.status_callback("lifecycle", DiagnosticText(msg))
 
 
 def conversation_history_after_compression(
@@ -3040,6 +3042,18 @@ def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: An
             agent._session_db.set_session_title_source(agent.session_id, _src)
 
 
+def _compression_child_source(agent: Any, parent_session_id: str) -> str:
+    """The parent row's persisted source: a compression child is the same conversation, so a ``--source tool``,
+    ``oneshot`` or inherited ``kanban`` label must not degrade to the bare ``agent.platform`` (#112550)."""
+    parent = None
+    with contextlib.suppress(Exception):
+        parent = agent._session_db.get_session(parent_session_id)
+    if parent and parent.get("source"):
+        return parent["source"]
+    from run_agent import _session_source_for_agent  # late: run_agent imports this module
+    return _session_source_for_agent(getattr(agent, "platform", None))
+
+
 def _publish_rotated_compaction(
     agent: Any, messages: list, compressed: list, *, new_system_prompt: str, lease: _CompressionLease,
     old_session_id: str, compressed_user_turn_outcome: str,
@@ -3078,7 +3092,7 @@ def _publish_rotated_compaction(
     from agent.context_compressor import _DB_PERSISTED_MARKER
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
-        source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"), model=agent.model,
+        source=_compression_child_source(agent, old_session_id), model=agent.model,
         model_config=agent._session_init_model_config, system_prompt=new_system_prompt, messages=compressed,
         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
@@ -3204,7 +3218,7 @@ def _finish_compaction_boundary(
             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — accuracy may degrade. Consider /new to start fresh."
         )
         agent._compression_warning = _cc_msg
-        agent._emit_status(_cc_msg)
+        agent._emit_diagnostic_status(_cc_msg)
 
     # session:compress lets hooks ingest the old session before it's lost;
     # in_place=True tells them the same id was compacted rather than rotated.

@@ -21,10 +21,11 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.error_classifier import _BILLING_PATTERNS, _OVERLOADED_PATTERNS
+from agent.auxiliary_structured_output import remember_structured_output_rejection
 from agent.codex_headers import (
     CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
     apply_required_codex_headers as _apply_required_codex_headers,
@@ -110,7 +111,10 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
-from agent.auxiliary_health import _custom_health_base_url, _unhealthy_cache_key
+from agent.auxiliary_health import (
+    _custom_health_base_url, _unhealthy_cache_key, fallback_candidate_quarantine_ttl,
+    fallback_candidate_unavailable_reason,
+)
 from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, nous_credential_failure_detail,
     record_nous_credential_failure)
@@ -2209,7 +2213,7 @@ def _warn_paid_lane_once(model: str) -> None:
     )
 
 
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter(explicit_api_key: Optional[Union[str, Callable[[], str]]] = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     free_only, cfg_model = _aux_openrouter_settings()
     or_model = model or cfg_model
     if free_only and not _is_free_model(or_model):
@@ -2637,7 +2641,7 @@ def set_runtime_main(
         "requested_provider": (requested_provider or "").strip().lower(),
         "model": (model or "").strip(),
         "base_url": (base_url or "").strip(),
-        "api_key": api_key.strip() if isinstance(api_key, str) else api_key if callable(api_key) else "",
+        "api_key": _normalize_api_key(api_key),
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
@@ -2906,7 +2910,7 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic(explicit_api_key: Optional[Union[str, Callable[[], str]]] = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client
         from agent.anthropic_credentials import resolve_anthropic_token
@@ -3921,12 +3925,17 @@ def _plan_fallback_candidate(
 
 def _quarantine_fallback_candidate(
     task: Optional[str], fb_label: str, fb_provider: str, fb_err: Exception, *,
-    base_url: str = "", tag: str = "",
+    base_url: str = "", tag: str = "", reason: Optional[str] = None,
 ) -> None:
-    """Refresh unavailable or still 401s: token is dead. Quarantine the candidate so the caller moves on."""
-    _mark_provider_unhealthy(fb_provider or fb_label, base_url=base_url, reason="stale fallback credential")
-    logger.warning("Auxiliary %s%s: fallback candidate %s has a stale/unrefreshable "
-                   "credential (%s) — skipping to next fallback", task or "call", tag, fb_label, fb_err)
+    """The candidate cannot serve this walk (``reason`` = its ``_FALLBACK_REASONS`` capacity label,
+    None = dead token): mark it unhealthy so the ordered re-walk skips it and the caller moves on to
+    the next entry. Transient classes get a short hold, payment/quota and dead tokens the long one."""
+    _mark_provider_unhealthy(
+        fb_provider or fb_label, ttl=fallback_candidate_quarantine_ttl(reason),
+        base_url=base_url, reason=reason or "stale fallback credential")
+    why = f"is out of capacity ({reason})" if reason else "has a stale/unrefreshable credential"
+    logger.warning("Auxiliary %s%s: fallback candidate %s %s (%s) — skipping to next fallback",
+                   task or "call", tag, fb_label, why, fb_err)
 
 
 def _plan_fallback_auth_retry(
@@ -3957,7 +3966,9 @@ def _call_fallback_candidate_sync(
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
     credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
-    provider and return None so the caller moves on. Non-auth errors raise.
+    provider and return None so the caller moves on. A capacity error (quota/rate-limit 429, 402,
+    connection, route-incompatible model, malformed response) also quarantines and returns None so
+    the ordered chain advances to the next configured entry (#106367); other errors raise.
 
     ``effective_timeout`` is the task-level deadline; a configured-chain candidate with its own ``timeout``
     entry gets that instead, so a fallback tuned differently from the primary is allowed its own budget
@@ -3990,7 +4001,13 @@ def _call_fallback_candidate_sync(
         return _send_recovering(fb_client, fb_kwargs, destination)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
-            raise
+            capacity = fallback_candidate_unavailable_reason(fb_err)
+            if capacity is None:
+                raise
+            _quarantine_fallback_candidate(
+                task, fb_label, destination.provider, fb_err, base_url=destination.base_url,
+                reason=capacity)
+            return None
         fb_provider, retry = _plan_fallback_auth_retry(
             destination, rebuild, async_mode=False, failed_api_key=getattr(fb_client, "api_key", ""))
         failed_destination = destination
@@ -3999,7 +4016,7 @@ def _call_fallback_candidate_sync(
             try:
                 return _send_recovering(*retry)
             except Exception as retry_err:
-                if not _is_auth_error(retry_err):
+                if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
                     raise
         _quarantine_fallback_candidate(
             task, fb_label, fb_provider, fb_err, base_url=failed_destination.base_url,
@@ -4034,7 +4051,13 @@ async def _call_fallback_candidate_async(
         return await _send_recovering(fb_client, fb_kwargs, destination)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
-            raise
+            capacity = fallback_candidate_unavailable_reason(fb_err)
+            if capacity is None:
+                raise
+            _quarantine_fallback_candidate(
+                task, fb_label, destination.provider, fb_err, base_url=destination.base_url,
+                tag=" (async)", reason=capacity)
+            return None
         fb_provider, retry = _plan_fallback_auth_retry(
             destination, rebuild, async_mode=True, failed_api_key=getattr(fb_client, "api_key", ""))
         failed_destination = destination
@@ -4043,7 +4066,7 @@ async def _call_fallback_candidate_async(
             try:
                 return await _send_recovering(*retry)
             except Exception as retry_err:
-                if not _is_auth_error(retry_err):
+                if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
                     raise
         _quarantine_fallback_candidate(
             task, fb_label, fb_provider, fb_err,
@@ -4704,7 +4727,7 @@ class _ResolveRequest(NamedTuple):
     async_mode: bool
     raw_codex: bool
     explicit_base_url: Optional[str]
-    explicit_api_key: Optional[str]
+    explicit_api_key: Optional[Union[str, Callable[[], str]]]
     api_mode: Optional[str]
     main_runtime: Optional[Dict[str, Any]]
     is_vision: bool
@@ -4712,6 +4735,13 @@ class _ResolveRequest(NamedTuple):
 
 
 _ResolveResult = Tuple[Optional[Any], Optional[str]]
+
+
+def _normalize_api_key(raw: Any) -> Union[str, Callable[[], str]]:
+    """A key_cmd/Entra callable passes through uncalled; strings are stripped; anything else is ''."""
+    if callable(raw) and not isinstance(raw, str):
+        return raw
+    return raw.strip() if isinstance(raw, str) else ""
 
 
 def _log_once_debug(seen: set, key: Any, msg: str, *args: Any) -> None:
@@ -4899,10 +4929,10 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
             # SECURITY: a local-server alias never borrows OPENAI_API_KEY or the main key —
             # the alias means "this is my own server"; sending an OpenAI secret to whatever
             # host base_url names is never intended. Explicit api_key or the placeholder only.
-            custom_key = (req.explicit_api_key or "").strip() or "no-key-required"
+            custom_key = _normalize_api_key(req.explicit_api_key) or "no-key-required"
         else:
             custom_key = (
-                (req.explicit_api_key or "").strip()
+                _normalize_api_key(req.explicit_api_key)
                 or _scoped_key_env("OPENAI_API_KEY")
                 or _read_main_api_key_if_same_host(custom_base)
                 or "no-key-required"  # local servers don't need auth
@@ -4916,7 +4946,7 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         # Re-resolution loses the provider name and falls back to OpenRouter or a wrong API-key provider —
         # the main agent already solved this, we just need to reuse its answer. (#45472)
         _main_base = str(main_runtime.get("base_url") or "").strip().rstrip("/")
-        _main_key = str(main_runtime.get("api_key") or "").strip()
+        _main_key = _normalize_api_key(main_runtime.get("api_key"))
         if _main_base and _main_key:
             custom_base, custom_key = _main_base, _main_key
     if custom_base and custom_key:
@@ -4985,7 +5015,7 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     # whatever the caller left blank, never replaces what the caller set (compression prompts carry
     # conversation history, so a silently swapped destination is a data-routing bug, not a nuisance).
     custom_base = (req.explicit_base_url or custom_entry.get("base_url") or "").strip()
-    custom_key = (req.explicit_api_key or "").strip() or _named_custom_api_key(custom_entry, provider, custom_base)
+    custom_key = _normalize_api_key(req.explicit_api_key) or _named_custom_api_key(custom_entry, provider, custom_base)
     if custom_key == "no-key-required":
         logger.warning("resolve_provider_client: named custom provider %r has no resolvable "
                        "api_key — request will be sent with placeholder no-key-required "
@@ -5082,8 +5112,7 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
     api_key = str(creds.get("api_key", "")).strip()
     # Explicit api_key override (fallback_model / custom_providers entry) lets callers
     # authenticate where no built-in credential is registered for this alias.
-    if req.explicit_api_key:
-        api_key = req.explicit_api_key.strip() or api_key
+    api_key = _normalize_api_key(req.explicit_api_key) or api_key
     raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
     if req.explicit_base_url:
         raw_base_url = req.explicit_base_url.strip().rstrip("/")
@@ -5238,8 +5267,8 @@ _EXPLICIT_PROVIDER_BRANCHES: Dict[str, Callable[[_ResolveRequest], _ResolveResul
 
 def resolve_provider_client(
     provider: str, model: str = None, async_mode: bool = False, raw_codex: bool = False,
-    explicit_base_url: str = None, explicit_api_key: str = None, api_mode: str = None,
-    main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
+    explicit_base_url: str = None, explicit_api_key: Optional[Union[str, Callable[[], str]]] = None,
+    api_mode: str = None, main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
     task: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: return a configured client (auth, base URL, API format) for a provider + optional model.
@@ -6449,7 +6478,11 @@ def _build_call_kwargs(
     reasoning_config = clamp_reasoning_config(reasoning_config)
     projection = _project_provider_profile(provider, provider_norm, model, effective_base, reasoning_config)
     kwargs.update(projection.top_level)
-    if merged_extra := _merge_aux_extra_body(extra_body, projection, reasoning_config, provider_norm):
+    merged_extra = _merge_aux_extra_body(extra_body, projection, reasoning_config, provider_norm)
+    if "response_format" in merged_extra:
+        from agent.auxiliary_structured_output import without_unsupported_response_format
+        merged_extra = without_unsupported_response_format(merged_extra, provider_norm, effective_base, model, task)
+    if merged_extra:
         kwargs["extra_body"] = merged_extra
     # Anthropic Messages adapters take reasoning via a private kwarg that plain OpenAI SDK clients
     # would reject; Portal Claude is dual-wire, so include it only when the catalog id selects
@@ -7205,22 +7238,23 @@ def _is_max_tokens_rejection(exc: Exception, client: Any) -> bool:
 
 
 def _parameter_rungs(client: Any, max_tokens: Optional[int]) -> tuple:
-    """Ordered ``(matches, strip, log message)`` parameter rungs; ``strip`` returns None when the
-    field was not on the wire, so an unchanged request is never re-sent."""
+    """Ordered ``(matches, strip, log message, remember)`` parameter rungs; ``strip`` returns None
+    when the field was not on the wire, so an unchanged request is never re-sent; ``remember``
+    (optional) records the rejection per route so the next call omits the field up front."""
     return (
         (lambda exc: _is_unsupported_parameter_error(exc, "temperature"), _without_temperature,
-         "provider rejected temperature; retrying without it"),
+         "provider rejected temperature; retrying without it", None),
         (_is_structured_output_rejection, _without_structured_output_format,
          "provider rejected the structured-output format field; retrying without it "
-         "(schema enforcement degrades to prompt compliance)"),
+         "(schema enforcement degrades to prompt compliance)", remember_structured_output_rejection),
         # A chat-only model on an OpenAI-compatible relay rejects the profile's thinking-off encoding
         # (top-level ``reasoning_effort: none``), and strict-schema gateways reject the generic
         # ``extra_body.reasoning`` fallback outright (#109774); the caller only wanted "no thinking",
         # so retry with every reasoning field omitted and let the route default apply (#112781).
         (_is_reasoning_field_rejection, _without_reasoning_fields,
-         "provider rejected the reasoning field; retrying without it (route default applies)"),
+         "provider rejected the reasoning field; retrying without it (route default applies)", None),
         (lambda exc: max_tokens is not None and _is_max_tokens_rejection(exc, client), _without_max_tokens,
-         "provider rejected the output cap; retrying without it"),
+         "provider rejected the output cap; retrying without it", None),
     )
 
 
@@ -7235,17 +7269,20 @@ def _ladder_parameter_rungs(
     client, task, tag = route.client, route.task, route.tag
     rungs = list(_parameter_rungs(client, max_tokens))
     while rungs:
-        hit = next(((matches, strip, message) for matches, strip, message in rungs
-                    if matches(first_err) and strip(kwargs) is not None), None)
+        hit = next((rung for rung in rungs
+                    if rung[0](first_err) and rung[1](kwargs) is not None), None)
         if hit is None:
             break
         rungs.remove(hit)
-        matches, strip, message = hit
+        matches, strip, message, remember = hit
         retry_kwargs = strip(kwargs)
         logger.info("Auxiliary %s%s: %s: %s", task or "call", tag, message, first_err)
+        rejection = first_err
         resp, first_err = yield from _rung(
             _LadderStep("call", (client, retry_kwargs)), _param_rung_accepts)
         if first_err is None:
+            if remember is not None:
+                remember(route.resolved_provider, route.base_info, kwargs, rejection)
             return resp, None, retry_kwargs
         kwargs = retry_kwargs
     return None, first_err, kwargs
@@ -7376,9 +7413,10 @@ def _next_fallback_after_quarantine(
     task: Optional[str], resolved_provider: str, is_auto: bool, route: _LadderRoute,
     failed_model: Optional[str], failure_scope: Any,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Next candidate after a fallback entry was quarantined mid-request: remaining configured
-    entries (task chain, then main chain on auto) before the discovery chain."""
-    reason = "stale fallback credential"
+    """Next candidate after a fallback entry was quarantined mid-request (dead credential or a
+    capacity error): remaining configured entries (task chain, then main chain on auto) before the
+    discovery chain."""
+    reason = "fallback candidate unavailable"
     fb = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=failed_model,
         failed_base_url=route.base_info, failure_scope=failure_scope)
@@ -7453,26 +7491,29 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-    if fb_client is not None:
-        # Second pass: the candidate credential was stale and quarantined — re-walk the CONFIGURED
-        # chains first (the quarantined entry is now unhealthy and skipped, so later entries get
-        # their turn), then discovery where the selection policy allows it.
-        for _pass in range(2):
-            _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
-            fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
-            if fb_resp is not None:
-                return fb_resp
-            if _pass == 0:
-                fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
-                    task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope)
-                if fb_client is None:
-                    break
+    # Ordered walk: a candidate that returns None was quarantined (dead credential or a capacity
+    # error such as a quota 429) and is now unhealthy, so re-walking the CONFIGURED chains first
+    # lands on the next entry, then discovery where the selection policy allows it (#106367).
+    # Bounded by construction: every pass quarantines its candidate and the walk stops as soon as
+    # re-selection hands back a lane already tried, so each lane is attempted at most once.
+    tried_lanes: set = set()
+    while fb_client is not None:
+        lane = (fb_label, fb_model, str(getattr(fb_client, "base_url", "") or ""))
+        if lane in tried_lanes:
+            break
+        tried_lanes.add(lane)
+        _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
+        fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
+        if fb_resp is not None:
+            return fb_resp
+        fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
+            task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope)
     # All fallback layers exhausted — one user-visible warning, then re-raise.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
                    # All fallback layers exhausted — emit a single user-visible warning so the operator
                    # knows aux task is about to fail. (#26882) The error itself is re-raised below.
                    # (#26882)
-                   "(fallback_chain + main agent model). Raising the last error.",
+                   "(fallback_chain + main agent model). Raising the primary error.",
                    task or "call", tag, reason, resolved_provider)
     return None
 
