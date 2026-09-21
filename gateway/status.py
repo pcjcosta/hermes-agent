@@ -306,11 +306,21 @@ def _get_runtime_status_path() -> Path:
 
 
 def _get_lock_dir() -> Path:
-    """Machine-local dir for token-scoped gateway locks; ``HERMES_GATEWAY_LOCK_DIR`` overrides."""
+    """Cross-profile rendezvous dir for machine-local locks; ``HERMES_GATEWAY_LOCK_DIR`` overrides.
+
+    Scope is the **OS user**, not the kernel host: separate users have separate ``$HOME``s,
+    separate ``~/.hermes`` profile roots and separate credentials, so "one gateway per host"
+    means "one per host per OS user". Holds the token-scoped locks (:func:`acquire_scoped_lock`)
+    and the host-role lock + rendezvous record (``gateway/host_rendezvous.py``); the per-home
+    ``gateway.pid``/``gateway.lock`` above deliberately stay under each profile's HERMES_HOME.
+    """
     override = os.getenv("HERMES_GATEWAY_LOCK_DIR")
     if override:
         return Path(override)
-    state_home = Path(os.getenv("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    # XDG spec: a relative $XDG_STATE_HOME is INVALID and must be ignored. Honouring one made the
+    # lock dir CWD-relative, so two serves started from different directories shared no singleton.
+    state_home_env = os.getenv("XDG_STATE_HOME") or ""
+    state_home = Path(state_home_env) if os.path.isabs(state_home_env) else Path.home() / ".local" / "state"
     return state_home / "hermes" / _LOCKS_DIRNAME
 
 
@@ -508,6 +518,10 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     if not tokens:
         return None
     basenames = [t.rsplit("/", 1)[-1] for t in tokens]
+    # The launchd job's osascript wrapper (gateway_launchd.launchd_program_arguments) carries the gateway argv
+    # inside one AppleScript string; the gateway itself is its child and is matched on its own command line.
+    if basenames[0] == "osascript":
+        return None
     # Gateway-dedicated entrypoints carry no subcommand to inspect.
     if any(t == "gateway/run.py" or t.endswith("/gateway/run.py") for t in tokens):
         return "run"
