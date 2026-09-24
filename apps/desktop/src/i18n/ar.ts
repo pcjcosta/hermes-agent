@@ -642,6 +642,10 @@ export const ar = defineLocale({
       backdropDesc: 'اختيار مقدار مزج خلفية سطح المكتب مع سطح Hermes.',
       userBubbleTitle: 'فقاعة الرسالة',
       userBubbleDesc: 'مدى شفافية رسائلك. معتمة عند 0؛ يبقى الإطار فقط عند 100.',
+      textDirectionTitle: 'اتجاه النص',
+      textDirectionDesc:
+        'كيف تحدد رسائل المحادثة وحقل الكتابة اتجاهها. «تلقائي» يتبع أول حرف في كل فقرة؛ اختر اتجاهًا عندما يظهر النص المختلط بترتيب خاطئ. تبقى الشيفرة دائمًا من اليسار إلى اليمين.',
+      textDirection: { auto: 'تلقائي', rtl: 'من اليمين إلى اليسار', ltr: 'من اليسار إلى اليمين' },
       introSplashTitle: 'شاشة المقدمة',
       introSplashDesc: 'الشعار النصي والعبارة التمهيدية في محادثة فارغة.',
       reactionsTitle: 'تفاعلات الرسائل',
@@ -1086,6 +1090,9 @@ export const ar = defineLocale({
       moaSetDefault: 'تعيين الافتراضي',
       moaNewPresetPlaceholder: 'إعداد جديد',
       moaAddPreset: 'إضافة إعداد',
+      customModel: 'نموذج مخصص…',
+      customModelPlaceholder: 'معرّف النموذج',
+      chooseFromList: 'اختر من القائمة',
       moaDefault: 'الافتراضي:',
       moaReferenceToggle: (enabled, index) => `${enabled ? 'تعطيل' : 'تفعيل'} المرجع ${index}`,
       moaReferenceTitle: index => `المرجع ${index}`,
@@ -1986,6 +1993,39 @@ export const ar = defineLocale({
     missingBody: 'لم يعد هذا الناتج موجودًا في السجل المحلي.'
   },
   sidebar: {
+    profileRail: 'شريط الملفات الشخصية',
+    markAllRead: 'وضع علامة مقروء على الكل',
+    filter: {
+      grouping: 'تجميع',
+      ordering: 'ترتيب',
+      show: 'إظهار',
+      filters: 'تصفية',
+      status: 'الحالة',
+      pullRequest: 'طلب سحب',
+      profile: 'الملف الشخصي',
+      project: 'المشروع',
+      archived: 'مؤرشف',
+      resetToDefaults: 'إعادة تعيين إلى الافتراضي',
+      expandAll: 'توسيع الكل',
+      collapseAll: 'طي الكل',
+      inboxStyle: 'نمط البريد الوارد',
+      updated: 'محدّث',
+      created: 'أُنشئ',
+      tokens: 'الرموز',
+      cost: 'التكلفة',
+      manual: 'يدوي',
+      preview: 'معاينة',
+      pr: 'PR',
+      needsInput: 'يحتاج إدخالاً',
+      working: 'يعمل',
+      unread: 'غير مقروء',
+      draft: 'مسودة',
+      idle: 'خامل',
+      open: 'مفتوح',
+      merged: 'مدمج',
+      closed: 'مغلق',
+      noPR: 'لا يوجد PR'
+    },
     gatewayGroups: {
       grouping: 'البوابة والملف الشخصي',
       rename: 'إعادة تسمية المجموعة',
@@ -2706,13 +2746,18 @@ export const ar = defineLocale({
     proNeedsSubscription: 'يتطلب اشتراكا',
     free: 'مجاني',
     freeTier: 'طبقة مجانية',
-    priceTitle: 'السعر'
+    priceTitle: 'السعر',
+    customModel: 'نموذج مخصص',
+    addCustomModelAction: 'إضافة نموذج مخصص…',
+    customModelPlaceholder: 'اكتب معرّف النموذج، مثل openai/gpt-5'
   },
   modelVisibility: {
     title: 'النماذج',
     search: 'بحث في النماذج',
     noAuthenticatedProviders: 'لا يوجد مزوّدون مصادق عليهم.',
-    addProvider: 'إضافة مزوّد…'
+    addProvider: 'إضافة مزوّد…',
+    addCustomModel: 'إضافة نموذج مخصص',
+    removeCustomModel: 'إزالة النموذج المخصص'
   },
   shell: {
     windowControls: 'تحكم النافذة',
